@@ -1,0 +1,186 @@
+name: MQ Remote Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout RustDesk fork
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: MQ Remote branding
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path("flutter/windows/runner/Runner.rc"),
+              Path("flutter/windows/runner/main.cpp"),
+          ]
+          for p in files:
+              if p.exists():
+                  s = p.read_text(encoding="utf-8", errors="ignore")
+                  s = s.replace("RustDesk", "MQ Remote")
+                  p.write_text(s, encoding="utf-8")
+
+          root = Path("flutter/lib")
+          if root.exists():
+              for p in root.rglob("*.dart"):
+                  s = p.read_text(encoding="utf-8", errors="ignore")
+                  s2 = s.replace("RustDesk", "MQ Remote")
+                  if s2 != s:
+                      p.write_text(s2, encoding="utf-8")
+          PY
+
+      - name: Use upstream Windows build action
+        shell: powershell
+        run: |
+          Write-Host "Preparing dependencies through RustDesk build script"
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.24.5"
+          architecture: x64
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Generate Flutter bridge
+        shell: bash
+        run: |
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          cd flutter
+          flutter pub get
+          cd ..
+          flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/windows/runner/bridge_generated.h
+
+      - name: Build Windows
+        shell: powershell
+        run: |
+          python build.py --flutter
+          New-Item -ItemType Directory -Force MQRemote-Windows | Out-Null
+          $release = "flutter\build\windows\x64\runner\Release"
+          if (!(Test-Path $release)) { throw "Windows release folder not found" }
+          Copy-Item -Recurse -Force "$release\*" ".\MQRemote-Windows\"
+          if (Test-Path ".\MQRemote-Windows\rustdesk.exe") {
+            Rename-Item ".\MQRemote-Windows\rustdesk.exe" "MQRemote.exe" -Force
+          }
+          Compress-Archive -Path ".\MQRemote-Windows\*" -DestinationPath ".\MQRemote-Windows-x64.zip" -Force
+
+      - name: Upload Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: MQRemote-Windows-x64
+          path: MQRemote-Windows-x64.zip
+          retention-days: 14
+
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - name: Checkout RustDesk fork
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: MQ Remote branding
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path("flutter/macos/Runner/Configs/AppInfo.xcconfig"),
+              Path("flutter/macos/Runner/Info.plist"),
+          ]
+          for p in files:
+              if p.exists():
+                  s = p.read_text(encoding="utf-8", errors="ignore")
+                  s = s.replace("RustDesk", "MQ Remote")
+                  p.write_text(s, encoding="utf-8")
+
+          root = Path("flutter/lib")
+          if root.exists():
+              for p in root.rglob("*.dart"):
+                  s = p.read_text(encoding="utf-8", errors="ignore")
+                  s2 = s.replace("RustDesk", "MQ Remote")
+                  if s2 != s:
+                      p.write_text(s2, encoding="utf-8")
+          PY
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.24.5"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.75"
+          targets: aarch64-apple-darwin
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          brew install cmake nasm ninja pkg-config yasm opus create-dmg
+          git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          "$HOME/vcpkg/vcpkg" install libvpx:arm64-osx libyuv:arm64-osx opus:arm64-osx aom:arm64-osx
+
+      - name: Generate Flutter bridge
+        shell: bash
+        run: |
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          cd flutter
+          flutter pub get
+          cd ..
+          flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+
+      - name: Build macOS
+        shell: bash
+        run: |
+          export VCPKG_ROOT="$HOME/vcpkg"
+          export VCPKG_DEFAULT_TRIPLET=arm64-osx
+          python3 build.py --flutter
+          APP="$(find flutter/build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP"
+          rm -rf "MQ Remote.app"
+          cp -R "$APP" "MQ Remote.app"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName MQ Remote" "MQ Remote.app/Contents/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName MQ Remote" "MQ Remote.app/Contents/Info.plist" || true
+          codesign --force --deep --sign - "MQ Remote.app" || true
+          hdiutil create \
+            -volname "MQ Remote" \
+            -srcfolder "MQ Remote.app" \
+            -ov \
+            -format UDZO \
+            "MQRemote-macOS-AppleSilicon.dmg"
+
+      - name: Upload macOS
+        uses: actions/upload-artifact@v4
+        with:
+          name: MQRemote-macOS-AppleSilicon
+          path: MQRemote-macOS-AppleSilicon.dmg
+          retention-days: 14
